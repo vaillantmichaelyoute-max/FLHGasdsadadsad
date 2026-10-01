@@ -17,11 +17,6 @@ if ($portListener) {
     throw "Port $port is already in use, but the launcher auth health check failed."
 }
 
-$mongoListener = Get-NetTCPConnection -State Listen -LocalPort 27017 -ErrorAction SilentlyContinue
-if (-not $mongoListener) {
-    throw "MongoDB is not listening on port 27017."
-}
-
 $serverPath = Join-Path $PSScriptRoot "backend-auth-server.js"
 if (-not (Test-Path -LiteralPath $serverPath)) {
     throw "Auth server script not found at $serverPath."
@@ -35,7 +30,19 @@ $stdoutPath = Join-Path $logDirectory "auth-$logStamp.out.log"
 $stderrPath = Join-Path $logDirectory "auth-$logStamp.err.log"
 
 $env:PORT = [string]$port
-$env:MONGO_URI = "mongodb://127.0.0.1:27017/FISHKY"
+$backendConfigPath = Join-Path $PSScriptRoot "..\..\Config\config.json"
+if (-not $env:MONGO_URI) {
+    if (-not (Test-Path -LiteralPath $backendConfigPath)) {
+        throw "Backend config not found at $backendConfigPath. Set MONGO_URI before starting the launcher auth API."
+    }
+
+    $backendConfig = Get-Content -LiteralPath $backendConfigPath -Raw | ConvertFrom-Json
+    $env:MONGO_URI = [string]$backendConfig.mongodb.database
+    if (-not $env:MONGO_URI) {
+        throw "mongodb.database is missing from $backendConfigPath."
+    }
+}
+$env:RELOAD_BACKEND_URL = if ($env:RELOAD_BACKEND_URL) { $env:RELOAD_BACKEND_URL } else { "http://127.0.0.1:8080" }
 Start-Process `
     -FilePath $node.Source `
     -ArgumentList ('"{0}"' -f $serverPath) `

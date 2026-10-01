@@ -2,50 +2,29 @@
 
 ## 1) Update launcher env
 
-Open .env and set:
+Open `.env` and set the two service URLs:
 
 ```env
-VITE_BACKEND_URL=http://127.0.0.1:3552
+VITE_BACKEND_URL=http://127.0.0.1:8080
+VITE_AUTH_API_URL=http://127.0.0.1:3552
 VITE_ENABLE_API=true
 ```
 
-For a launcher installed on another computer, replace `127.0.0.1` with the publicly reachable backend host and use HTTPS. Loopback addresses only reach services on the same computer.
+`VITE_BACKEND_URL` is the Lawin game backend from this repository (port 8080). `VITE_AUTH_API_URL` is the launcher's account/news API (port 3552). For other computers, replace both loopback hosts with the backend's reachable address, use HTTPS where available, and add the account API origin to the HTTP request scope in `src-tauri/tauri.conf.json` before building. Loopback addresses only reach services on the same computer.
 
 ## 2) Start the auth server
 
-In CMD:
+Run `start-auth-server.ps1` from the launcher folder. It reads the MongoDB URI from this repository's `Config/config.json` and points the storefront proxy at the Lawin server on port 8080. Discord IDs in `Config/config.json`'s `moderators` list are granted the launcher's admin permissions when linked to a launcher account. You can also set `ADMIN_EMAILS` or `MODERATOR_DISCORD_IDS` in the auth server environment, or mark a MongoDB user with `isAdmin: true` or `role: "admin"`. Never put admin credentials in the launcher configuration.
 
-```cmd
-cd /d "C:\Users\rayan\Documents\Project Fishk\OGFN-Launcher-skids-TEST\OGFN-Launcher-skids-TEST"
-set MONGO_URI=mongodb://127.0.0.1:27017/FISHKY
-set PORT=3552
-set ADMIN_EMAILS=admin@example.com
-node backend-auth-server.js
-```
+## 3) Create a launcher account
 
-`ADMIN_EMAILS` is a comma-separated server-side allowlist. You can instead mark an existing user as admin in MongoDB by setting `isAdmin: true` or `role: "admin"`. Never put an admin password in the launcher configuration.
+Use the existing Discord bot's `/create` command. It saves the Discord user's ID in Lawin's `discordId` field, along with the email and password the launcher uses. The launcher accepts this existing link; old Lawin records do not need a `discordLinked` field.
 
-## 3) Create a valid user
+## 4) Configure Discord sign-in
 
-Use MongoDB to create one test user with a Discord ID and a hashed password.
+In the Discord Developer Portal, add `http://127.0.0.1:3552/api/auth/discord/callback` as an OAuth2 redirect URI. Put the application's client ID in `VITE_DISCORD_CLIENT_ID` and its client secret in `DISCORD_CLIENT_SECRET` in the local `.env`; the secret must never use a `VITE_` name or be included in a launcher build. For a remotely hosted auth API, use its HTTPS callback URL and set the same value in `DISCORD_REDIRECT_URI`. Restart the auth server after changing these values. Users still need an existing `/create` account linked to the same Discord ID.
 
-Example Mongo document:
-
-```json
-{
-  "email": "player@example.com",
-  "username": "Fishky",
-  "password": "$2b$10$examplehash",
-  "discordId": "123456789012345678",
-  "discordLinked": true,
-  "isAdmin": false,
-  "role": "user",
-  "avatarHash": "abc123",
-  "banned": false
-}
-```
-
-## 4) Login contract
+## 5) Login contract
 
 POST to http://127.0.0.1:3552/api/auth/login
 
@@ -82,14 +61,24 @@ Failure:
 }
 ```
 
-## 5) Important
+## 6) Important
 
-The host account from Reload-Backend is not a normal launcher account and has no Discord ID, so it should be rejected by design.
+Discord sign-in creates a short-lived launcher session for the account linked to that Discord ID. Fortnite itself still requires the game account password; Discord-only users are prompted for it when launching. The email/password sign-in remains available.
 
-## 6) Admin news and media
+## 7) Account checks and ban appeals
 
-Admin accounts can publish announcements from the launcher's News tab. The API checks the account against the server-side `ADMIN_EMAILS` allowlist or the account's MongoDB `isAdmin`/`role` fields; a client-side flag alone cannot publish.
+The launcher calls `POST /api/auth/validate` at startup and again immediately before launching Fortnite. Deleted accounts and invalid saved credentials are signed out; network failures keep the saved session and offer retry. Active bans return the stored reason and `bannedUntil` date.
+
+`POST /api/auth/appeal` stores one pending appeal per account in the `launcherBanAppeals` MongoDB collection. To notify a Discord channel from this auth service, set `DISCORD_BOT_TOKEN` and `BAN_APPEALS_CHANNEL_ID` in its server environment. Without a notification channel, appeals are still persisted in MongoDB for administrator review.
+
+## 8) Admin news and media
+
+Admin accounts can publish announcements from the Home page. The API checks the account against the server-side `ADMIN_EMAILS` allowlist or the account's MongoDB `isAdmin`/`role` fields; a client-side flag alone cannot publish.
 
 The feed is public at `GET /api/news`. Admin publishing uses `POST /api/news`. Uploaded JPG, PNG, WebP, GIF, MP4, and WebM media is limited to 50 MB and stored under `data/news-media` by default; set `NEWS_MEDIA_DIRECTORY` to a persistent folder on the backend host if needed. News metadata is stored in the `launcherNews` MongoDB collection.
 
-After granting admin access, restart the auth server and sign out/in in the launcher so the login response refreshes the user's admin flag. For shared announcements, deploy this API and its media directory on a host reachable by every launcher user, and configure the launcher to use that HTTPS backend URL.
+The Discord bot syncs linked accounts' highest configured guild rank to MongoDB at startup and whenever a member's Discord roles change. The launcher validates the account on focus and every 30 seconds, so rank labels and admin access update without signing out. Keep the bot online and connected to the Discord server containing the configured role IDs. For shared announcements, deploy this API and its media directory on a host reachable by every launcher user, and configure the launcher to use that HTTPS backend URL.
+
+## 9) Community shops
+
+The launcher community tab lets signed-in users search cosmetics and publish up to five public lineups, with up to twelve cosmetics per lineup. Shops are stored in MongoDB's `launcherCommunityShops` collection. Owners can delete their own shops; public listings do not expose account IDs or email addresses. The auth API must be reachable by launcher clients for shop creation and browsing.

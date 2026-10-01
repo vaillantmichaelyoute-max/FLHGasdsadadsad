@@ -1,11 +1,13 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Body, fetch as tauriFetch, ResponseType } from "@tauri-apps/api/http";
-import { ImagePlus, Newspaper, RefreshCw, Send, Video, X } from "lucide-react";
+import { open } from "@tauri-apps/api/shell";
+import { ArrowUpRight, ImagePlus, Newspaper, Play, RefreshCw, Send, ShoppingCart, Video, X } from "lucide-react";
 import { Defaults } from "./defaults";
 
 type NewsUser = {
   email: string;
   password?: string;
+  authToken?: string;
   username?: string;
   isAdmin?: boolean;
 };
@@ -21,10 +23,28 @@ type NewsItem = {
 };
 
 type NewsResponse = { items?: NewsItem[]; item?: NewsItem; message?: string };
+type NewsPanelProps = {
+  user: NewsUser | null;
+  variant?: "page" | "home";
+  onPlay?: () => void;
+  playLabel?: string;
+  playDisabled?: boolean;
+  isAdmin?: boolean;
+  hostLabel?: string;
+  hostStatus?: string;
+  hostBusy?: boolean;
+  onStartHost?: () => void;
+  onSelectErbiumDll?: () => void;
+  onOpenShop?: () => void;
+};
 
 const acceptedMediaTypes = new Set([
   "image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm",
 ]);
+
+function hasTauriRuntime() {
+  return typeof window !== "undefined" && typeof (window as Window & { __TAURI_IPC__?: unknown }).__TAURI_IPC__ === "function";
+}
 
 function fileToDataUrl(file: File) {
   return new Promise<string>((resolve, reject) => {
@@ -35,8 +55,10 @@ function fileToDataUrl(file: File) {
   });
 }
 
-export default function NewsPanel({ user }: { user: NewsUser | null }) {
+export default function NewsPanel({ user, variant = "page", onPlay, playLabel = "Play now", playDisabled = false, isAdmin = false, hostLabel = "Start host", hostStatus = "", hostBusy = false, onStartHost, onSelectErbiumDll, onOpenShop }: NewsPanelProps) {
+  const isHome = variant === "home";
   const [items, setItems] = useState<NewsItem[]>([]);
+  const [selectedNewsItem, setSelectedNewsItem] = useState<NewsItem | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [title, setTitle] = useState("");
@@ -49,8 +71,12 @@ export default function NewsPanel({ user }: { user: NewsUser | null }) {
   const loadNews = async () => {
     setLoading(true);
     setLoadError("");
+    if (!hasTauriRuntime()) {
+      setLoading(false);
+      return;
+    }
     try {
-      const response = await tauriFetch<NewsResponse>(`${Defaults.BACKEND_URL}/api/news`, {
+      const response = await tauriFetch<NewsResponse>(`${Defaults.AUTH_API_URL}/api/news`, {
         method: "GET",
         responseType: ResponseType.JSON,
       });
@@ -97,7 +123,7 @@ export default function NewsPanel({ user }: { user: NewsUser | null }) {
   const publishNews = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setPublishError("");
-    if (!user?.email || !user.password) {
+    if (!user?.email || (!user.password && !user.authToken)) {
       setPublishError("Sign out and sign in again before publishing.");
       return;
     }
@@ -105,12 +131,13 @@ export default function NewsPanel({ user }: { user: NewsUser | null }) {
     setPublishing(true);
     try {
       const mediaData = mediaFile ? await fileToDataUrl(mediaFile) : null;
-      const response = await tauriFetch<NewsResponse>(`${Defaults.BACKEND_URL}/api/news`, {
+      const response = await tauriFetch<NewsResponse>(`${Defaults.AUTH_API_URL}/api/news`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: Body.json({
           email: user.email,
           password: user.password,
+          authToken: user.authToken,
           title,
           body,
           mediaData,
@@ -132,17 +159,72 @@ export default function NewsPanel({ user }: { user: NewsUser | null }) {
     }
   };
 
+  const featuredItem = items[0];
+  const featuredImage = featuredItem?.mediaPath && !featuredItem.mediaType?.startsWith("video/")
+    ? `${Defaults.AUTH_API_URL}${featuredItem.mediaPath}`
+    : Defaults.BACKGROUND_URL;
+
   return (
-    <div className="mx-auto max-w-5xl pb-8">
-      <div className="mb-6 flex items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold text-white">News</h1>
-          <p className="mt-1 text-sm text-slate-400">Announcements and updates from the team</p>
+    <div className={isHome ? "home-news-page" : "mx-auto max-w-5xl pb-8"}>
+      {isHome ? (
+        <header className="home-news-header">
+          <div>
+            <span className="home-panel-kicker">COMMUNITY / HOME</span>
+            <h1>Hey, {user?.username ?? user?.email?.split("@")[0] ?? "Player"}!</h1>
+            <p>Updates, game nights, and everything happening in the community.</p>
+          </div>
+          <button type="button" onClick={() => void loadNews()} disabled={loading} title="Refresh updates" aria-label="Refresh updates" className="home-news-refresh">
+            <RefreshCw size={16} />
+          </button>
+        </header>
+      ) : (
+        <div className="mb-6 flex items-center justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold text-white">News</h1>
+            <p className="mt-1 text-sm text-slate-400">Announcements and updates from the team</p>
+          </div>
+          <button type="button" onClick={() => void loadNews()} disabled={loading} title="Refresh news" aria-label="Refresh news" className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-white/10 text-slate-300 transition hover:bg-white/5 disabled:opacity-50">
+            <RefreshCw size={16} />
+          </button>
         </div>
-        <button type="button" onClick={() => void loadNews()} disabled={loading} title="Refresh news" aria-label="Refresh news" className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-white/10 text-slate-300 transition hover:bg-white/5 disabled:opacity-50">
-          <RefreshCw size={16} />
-        </button>
-      </div>
+      )}
+
+      {isHome && (
+        <>
+          <section className="home-news-feature">
+            {featuredItem?.mediaType?.startsWith("video/") ? (
+              <video src={`${Defaults.AUTH_API_URL}${featuredItem.mediaPath}`} autoPlay muted loop playsInline className="home-news-feature-media" />
+            ) : (
+              <img src={featuredImage} alt={featuredItem?.title ?? "Featured launcher update"} className="home-news-feature-media" />
+            )}
+            <div className="home-news-feature-shade" />
+            <div className="home-news-feature-copy">
+              <span className="home-panel-kicker">{featuredItem ? "FEATURED UPDATE" : "YOUR GAME CENTER"}</span>
+              <h2>{featuredItem?.title ?? `Welcome to ${Defaults.LAUNCHER_NAME}`}</h2>
+              <p>{featuredItem?.body ?? "Your community, game library, and daily shop are ready when you are."}</p>
+              <div className="home-news-feature-actions">
+                {onPlay && <button type="button" data-tour="play" onClick={onPlay} disabled={playDisabled} className="launcher-play-button inline-flex items-center gap-2 px-4 py-2.5 text-xs font-extrabold disabled:opacity-50"><Play size={14} fill="currentColor" />{playLabel}</button>}
+                {isAdmin && onStartHost && <button type="button" onClick={onStartHost} disabled={hostBusy} className="home-news-secondary-action">{hostBusy ? "Starting host..." : hostLabel}</button>}
+                {featuredItem && <span>{featuredItem.author} · {new Date(featuredItem.publishedAt).toLocaleDateString()}</span>}
+              </div>
+              {isAdmin && onSelectErbiumDll && <button type="button" onClick={onSelectErbiumDll} className="home-news-admin-link">{hostStatus || "Select Erbium.dll"}</button>}
+            </div>
+          </section>
+
+          <div className="home-news-promos">
+            <button type="button" onClick={() => void open(Defaults.DISCORD_LINK)} className="home-news-promo home-news-promo-community">
+              <span className="home-news-promo-icon"><Newspaper size={18} /></span>
+              <span><strong>Join the community</strong><small>News, polls, and support</small></span>
+              <ArrowUpRight size={15} />
+            </button>
+            <button type="button" onClick={() => onOpenShop?.()} className="home-news-promo home-news-promo-shop">
+              <span className="home-news-promo-icon"><ShoppingCart size={18} /></span>
+              <span><strong>Daily shop</strong><small>See what is in rotation</small></span>
+              <ArrowUpRight size={15} />
+            </button>
+          </div>
+        </>
+      )}
 
       {user?.isAdmin && (
         <form onSubmit={publishNews} className="launcher-surface mb-6 rounded-md p-5 md:p-6">
@@ -180,6 +262,7 @@ export default function NewsPanel({ user }: { user: NewsUser | null }) {
       )}
 
       {loadError && <p role="alert" className="mb-4 rounded-md border border-red-400/20 bg-red-500/10 p-3 text-xs text-red-200">{loadError}</p>}
+      {isHome && <div className="home-news-list-heading"><h2>Latest news</h2><span>{items.length} updates</span></div>}
       {loading && items.length === 0 ? (
         <div className="launcher-surface grid min-h-52 place-items-center rounded-md text-sm text-slate-400">Loading announcements...</div>
       ) : items.length === 0 ? (
@@ -187,6 +270,33 @@ export default function NewsPanel({ user }: { user: NewsUser | null }) {
           <Newspaper className="mb-3 text-slate-500" size={24} />
           <p className="text-sm font-medium text-slate-200">No announcements yet</p>
           <p className="mt-1 text-xs text-slate-500">New updates from the team will appear here.</p>
+        </div>
+      ) : isHome ? (
+        <div className="home-news-grid">
+          {items.map((item) => (
+            <article
+              key={item.id}
+              className="home-news-card"
+              role="button"
+              tabIndex={0}
+              onClick={() => setSelectedNewsItem(item)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  setSelectedNewsItem(item);
+                }
+              }}
+            >
+              <div className="home-news-card-media">
+                {item.mediaPath && item.mediaType && !item.mediaType.startsWith("video/") ? <img src={`${Defaults.AUTH_API_URL}${item.mediaPath}`} alt="" /> : <img src={Defaults.PLACEHOLDER_IMAGE} alt="" />}
+              </div>
+              <div className="home-news-card-copy">
+                <h3>{item.title}</h3>
+                <p>{item.body}</p>
+                <span>{item.author} · {new Date(item.publishedAt).toLocaleDateString()}</span>
+              </div>
+            </article>
+          ))}
         </div>
       ) : (
         <div className="divide-y divide-white/10 border-y border-white/10">
@@ -200,14 +310,36 @@ export default function NewsPanel({ user }: { user: NewsUser | null }) {
               {item.mediaPath && item.mediaType && (
                 <div className="overflow-hidden rounded-md border border-white/10 bg-black/20">
                   {item.mediaType.startsWith("video/") ? (
-                    <video src={`${Defaults.BACKEND_URL}${item.mediaPath}`} controls preload="metadata" className="max-h-64 w-full object-contain" />
+                    <video src={`${Defaults.AUTH_API_URL}${item.mediaPath}`} controls preload="metadata" className="max-h-64 w-full object-contain" />
                   ) : (
-                    <img src={`${Defaults.BACKEND_URL}${item.mediaPath}`} alt={item.title} className="max-h-64 w-full object-contain" />
+                    <img src={`${Defaults.AUTH_API_URL}${item.mediaPath}`} alt={item.title} className="max-h-64 w-full object-contain" />
                   )}
                 </div>
               )}
             </article>
           ))}
+        </div>
+      )}
+
+      {selectedNewsItem && (
+        <div className="home-news-modal-backdrop" role="presentation" onClick={() => setSelectedNewsItem(null)}>
+          <article className="home-news-modal" role="dialog" aria-modal="true" aria-label={selectedNewsItem.title} onClick={(event) => event.stopPropagation()}>
+            <button type="button" className="home-news-modal-close" aria-label="Close news update" onClick={() => setSelectedNewsItem(null)}><X size={18} /></button>
+            {selectedNewsItem.mediaPath && selectedNewsItem.mediaType && (
+              <div className="home-news-modal-media">
+                {selectedNewsItem.mediaType.startsWith("video/") ? (
+                  <video src={`${Defaults.AUTH_API_URL}${selectedNewsItem.mediaPath}`} controls autoPlay muted />
+                ) : (
+                  <img src={`${Defaults.AUTH_API_URL}${selectedNewsItem.mediaPath}`} alt={selectedNewsItem.title} />
+                )}
+              </div>
+            )}
+            <div className="home-news-modal-copy">
+              <span className="home-panel-kicker">{selectedNewsItem.author} · {new Date(selectedNewsItem.publishedAt).toLocaleDateString()}</span>
+              <h2>{selectedNewsItem.title}</h2>
+              <p>{selectedNewsItem.body}</p>
+            </div>
+          </article>
         </div>
       )}
     </div>

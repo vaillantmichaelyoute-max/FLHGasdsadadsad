@@ -9,8 +9,9 @@ use tauri::{AppHandle, Manager};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_SUSPENDED: u32 = 0x00000004;
-const ERBIUM_INJECTION_DELAY: Duration = Duration::from_secs(60);
+const ERBIUM_INJECTION_DELAY: Duration = Duration::from_secs(10);
 const HOST_RESTART_DELAY: Duration = Duration::from_secs(10);
+const DLL_INJECTION_GAP: Duration = Duration::from_millis(500);
 
 static HOST_RUNNING: AtomicBool = AtomicBool::new(false);
 static HOST_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -56,6 +57,19 @@ fn stop_host_process(pid: u32) {
         .spawn();
 }
 
+fn cleanup_and_return(
+    pid: u32,
+    game_process: &mut Child,
+    launcher_process: &mut Option<Child>,
+    eac_process: &mut Option<Child>,
+) {
+    stop_host_process(pid);
+    let _ = game_process.wait();
+    HOST_GAME_PID.store(0, Ordering::SeqCst);
+    stop_child(launcher_process);
+    stop_child(eac_process);
+}
+
 #[tauri::command]
 pub fn is_erbium_host_running() -> bool {
     HOST_RUNNING.load(Ordering::SeqCst)
@@ -68,44 +82,104 @@ pub fn stop_erbium_host() {
 }
 
 #[tauri::command]
+pub fn get_largepakpatch_path(app: AppHandle) -> Result<String, String> {
+    let bundled_path = app.path_resolver()
+        .resolve_resource("resources/LargePakPatch.dll")
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("LargePakPatch.dll");
+            path.is_file().then_some(path)
+        })
+        .ok_or_else(|| "Bundled LargePakPatch.dll resource not found.".to_string())?;
+
+    let documents = dirs::document_dir().ok_or("Could not locate the Documents folder.")?;
+    let dll_directory = documents.join("Project Fishk").join("DLLs");
+    std::fs::create_dir_all(&dll_directory)
+        .map_err(|error| format!("Could not create {}: {error}", dll_directory.display()))?;
+
+    let destination = dll_directory.join("LargePakPatch.dll");
+    let bundled_bytes = std::fs::read(&bundled_path)
+        .map_err(|error| format!("Could not read bundled LargePakPatch.dll: {error}"))?;
+    let already_current = std::fs::read(&destination)
+        .map(|installed_bytes| installed_bytes == bundled_bytes)
+        .unwrap_or(false);
+    if !already_current {
+        std::fs::write(&destination, bundled_bytes)
+            .map_err(|error| format!("Could not install LargePakPatch.dll to {}: {error}", destination.display()))?;
+    }
+
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn get_erbium_dll_path(app: AppHandle) -> Result<String, String> {
+    app.path_resolver()
+        .resolve_resource("resources/ErbiumClient-PreEdits.dll")
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "ErbiumClient-PreEdits.dll resource not found.".to_string())
+}
+
+#[tauri::command]
 pub fn start_erbium_host(
     game_root: String,
     email: String,
     password: String,
     erbium_dll_path: String,
+    largepakpatch_dll_path: String,
     app: AppHandle,
 ) -> Result<(), String> {
     let game_root = PathBuf::from(game_root);
     let erbium_dll = PathBuf::from(erbium_dll_path);
+    let largepakpatch_dll = PathBuf::from(largepakpatch_dll_path);
     let binaries = game_root.join("FortniteGame").join("Binaries").join("Win64");
     let game_executable = binaries.join("FortniteClient-Win64-Shipping.exe");
 
     if !game_executable.is_file() {
         return Err("The selected build is missing FortniteClient-Win64-Shipping.exe.".to_string());
     }
+
     let game_version = carter::detect_fortnite_version(&game_root.to_string_lossy())?;
     if game_version != "13.40" {
-        return Err(format!("This Erbium build is configured for Fortnite 13.40, but the selected build is {game_version}."));
+        return Err(format!(
+            "This Erbium build is configured for Fortnite 13.40, but the selected build is {game_version}."
+        ));
     }
+
     if !erbium_dll.is_file() {
         return Err("Select a built Erbium.dll file before starting the host.".to_string());
     }
+
+    if !largepakpatch_dll.is_file() {
+        return Err("LARGEPAKPATCH.DLL is missing from the launcher resources.".to_string());
+    }
+
     if email.trim().is_empty() || password.is_empty() {
         return Err("Sign in to the launcher before starting an Erbium host.".to_string());
     }
+
     if HOST_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("The Erbium host is already running.".to_string());
     }
 
     HOST_STOP_REQUESTED.store(false, Ordering::SeqCst);
-    if let Err(error) = carter::sync_paks_from_folder(&game_root.to_string_lossy(), &app) {
+
+    if let Err(error) = carter::sync_paks_from_folder(&game_root.to_string_lossy()) {
         HOST_RUNNING.store(false, Ordering::SeqCst);
         return Err(error);
     }
 
     let worker_app = app.clone();
     thread::spawn(move || {
-        if let Err(error) = run_host_supervisor(game_root, email, password, erbium_dll, worker_app.clone()) {
+        if let Err(error) = run_host_supervisor(
+            game_root,
+            email,
+            password,
+            erbium_dll,
+            largepakpatch_dll,
+            worker_app.clone(),
+        ) {
             emit_error(&worker_app, &error);
         }
         HOST_GAME_PID.store(0, Ordering::SeqCst);
@@ -124,6 +198,7 @@ fn run_host_supervisor(
     email: String,
     password: String,
     erbium_dll: PathBuf,
+    largepakpatch_dll: PathBuf,
     app: AppHandle,
 ) -> Result<(), String> {
     let binaries = game_root.join("FortniteGame").join("Binaries").join("Win64");
@@ -175,9 +250,10 @@ fn run_host_supervisor(
                 return Err(format!("Could not start Fortnite host: {error}"));
             }
         };
+
         let pid = game_process.id();
         HOST_GAME_PID.store(pid, Ordering::SeqCst);
-        emit_status(&app, "Waiting for Fortnite to load before injecting Erbium...");
+        emit_status(&app, "Waiting for Fortnite to load before injecting DLLs...");
 
         let started_at = Instant::now();
         let mut injected = false;
@@ -185,11 +261,7 @@ fn run_host_supervisor(
 
         loop {
             if HOST_STOP_REQUESTED.load(Ordering::SeqCst) {
-                stop_host_process(pid);
-                let _ = game_process.wait();
-                HOST_GAME_PID.store(0, Ordering::SeqCst);
-                stop_child(&mut launcher_process);
-                stop_child(&mut eac_process);
+                cleanup_and_return(pid, &mut game_process, &mut launcher_process, &mut eac_process);
                 return Ok(());
             }
 
@@ -200,26 +272,27 @@ fn run_host_supervisor(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    stop_host_process(pid);
-                    let _ = game_process.wait();
-                    HOST_GAME_PID.store(0, Ordering::SeqCst);
-                    stop_child(&mut launcher_process);
-                    stop_child(&mut eac_process);
+                    cleanup_and_return(pid, &mut game_process, &mut launcher_process, &mut eac_process);
                     return Err(format!("Could not monitor Fortnite host: {error}"));
                 }
             }
 
             if !injected && started_at.elapsed() >= ERBIUM_INJECTION_DELAY {
+                if let Err(error) = carter::inject_dll(pid, &largepakpatch_dll.to_string_lossy()) {
+                    cleanup_and_return(pid, &mut game_process, &mut launcher_process, &mut eac_process);
+                    return Err(format!("Could not inject LARGEPAKPATCH.DLL: {error}"));
+                }
+                emit_status(&app, "LargePakPatch injected.");
+
+                thread::sleep(DLL_INJECTION_GAP);
+
                 if let Err(error) = carter::inject_dll(pid, &erbium_dll.to_string_lossy()) {
-                    stop_host_process(pid);
-                    let _ = game_process.wait();
-                    HOST_GAME_PID.store(0, Ordering::SeqCst);
-                    stop_child(&mut launcher_process);
-                    stop_child(&mut eac_process);
+                    cleanup_and_return(pid, &mut game_process, &mut launcher_process, &mut eac_process);
                     return Err(format!("Could not inject Erbium.dll: {error}"));
                 }
+
                 injected = true;
-                emit_status(&app, "Erbium injected. Host is running.");
+                emit_status(&app, "LargePakPatch + Erbium injected. Host is running.");
             }
 
             thread::sleep(Duration::from_millis(500));
@@ -233,10 +306,15 @@ fn run_host_supervisor(
             return Ok(());
         }
         if !injected {
-            return Err("Fortnite exited before Erbium could be injected. Check the Fortnite build and login.".to_string());
+            return Err(
+                "Fortnite exited before the DLLs could be injected. Check the Fortnite build and login."
+                    .to_string(),
+            );
         }
         if !exit_status.success() {
-            return Err(format!("Fortnite host exited with status {exit_status}; automatic restart stopped."));
+            return Err(format!(
+                "Fortnite host exited with status {exit_status}; automatic restart stopped."
+            ));
         }
 
         emit_status(&app, "Match ended. Restarting the Erbium host in 10 seconds...");

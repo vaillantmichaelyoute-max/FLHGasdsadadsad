@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "projectlauncher"
-version = "1.0.46"
+version = "1.0.56"
 description = "Project Fishk launcher"
 authors = ["Project"]
 edition = "2021"
@@ -33,7 +33,7 @@ mongodb = "2.8"
 ntapi = "0.4.1"
 tauri-plugin-deep-link = { git = "https://github.com/FabianLars/tauri-plugin-deep-link", branch = "main" }
 reqwest = { version = "0.12", features = ["stream", "blocking"] }
-winapi = { version = "0.3", features = ["debugapi", "winuser", "tlhelp32", "aclapi", "accctrl", "libloaderapi", "memoryapi", "securitybaseapi", "shellapi", "processthreadsapi", "winnt"] }
+winapi = { version = "0.3", features = ["debugapi", "winuser", "tlhelp32", "aclapi", "accctrl", "libloaderapi", "memoryapi", "securitybaseapi", "shellapi", "processthreadsapi", "synchapi", "winnt"] }
 tauri = { version = "1.5", features = [ "api-all", "updater"] }
 serde = { version = "1.0", features = ["derive"] }
 window-shadows = "0.2.2"
@@ -62,3 +62,5 @@ features = ["attributes"]
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+

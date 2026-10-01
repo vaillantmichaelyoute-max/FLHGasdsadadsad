@@ -1,8 +1,8 @@
-use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
-use winapi::um::processthreadsapi::{CreateRemoteThread, OpenProcess};
-use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PROCESS_ALL_ACCESS};
+use winapi::um::memoryapi::{VirtualAllocEx, VirtualFreeEx, WriteProcessMemory};
+use winapi::um::processthreadsapi::{CreateRemoteThread, GetExitCodeThread, OpenProcess};
+use winapi::um::synchapi::WaitForSingleObject;
+use winapi::um::winnt::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, PROCESS_ALL_ACCESS};
 use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
-use std::time::{Duration};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::os::windows::process::CommandExt;
 use tauri::{AppHandle};
@@ -58,24 +58,50 @@ pub fn close_player_client() -> Result<(), String> {
 }
 
 fn release_version_from_branch(branch: &str) -> Option<String> {
-    let (_, suffix) = branch.split_once("Release-")?;
-    let version: String = suffix
+    let sanitized = branch
+        .trim()
+        .trim_matches('"')
+        .split_once("Release-")
+        .map(|(_, suffix)| suffix)
+        .unwrap_or(branch.trim());
+
+    let version: String = sanitized
         .chars()
         .take_while(|character| character.is_ascii_digit() || *character == '.')
         .collect();
-    let mut parts = version.split('.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
-    if !major.is_empty()
-        && !minor.is_empty()
-        && major.chars().all(|character| character.is_ascii_digit())
+
+    if version.is_empty() || version.starts_with('.') || version.ends_with('.') {
+        return None;
+    }
+
+    let parts: Vec<&str> = version.split('.').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let major = parts[0];
+    let minor = parts[1];
+    if major.chars().all(|character| character.is_ascii_digit())
         && minor.chars().all(|character| character.is_ascii_digit())
-        && parts.next().is_none()
     {
-        Some(version)
+        Some(format!("{major}.{minor}"))
     } else {
         None
     }
+}
+
+fn extract_version_from_manifest(manifest: &serde_json::Value) -> Option<String> {
+    for field_name in ["BranchName", "BuildVersionString", "BuildVersion", "Version"] {
+        if let Some(value) = manifest.get(field_name).and_then(serde_json::Value::as_str) {
+            if let Some(version) = release_version_from_branch(value) {
+                return Some(version);
+            }
+        }
+    }
+
+    let major = manifest.get("MajorVersion").and_then(serde_json::Value::as_i64)?;
+    let minor = manifest.get("MinorVersion").and_then(serde_json::Value::as_i64)?;
+    Some(format!("{major}.{minor}"))
 }
 
 pub fn detect_fortnite_version(game_root: &str) -> Result<String, String> {
@@ -88,13 +114,9 @@ pub fn detect_fortnite_version(game_root: &str) -> Result<String, String> {
         };
         let manifest: serde_json::Value = serde_json::from_str(&contents)
             .map_err(|_| format!("Could not read build metadata at {}.", manifest_path.display()))?;
-        let Some(branch) = manifest.get("BranchName").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(version) = release_version_from_branch(branch) else {
-            continue;
-        };
-        return Ok(version);
+        if let Some(version) = extract_version_from_manifest(&manifest) {
+            return Ok(version);
+        }
     }
 
     Err("Could not detect the Fortnite version from Build.version metadata.".to_string())
@@ -105,9 +127,19 @@ pub fn get_fortnite_version(game_root: String) -> Result<String, String> {
     detect_fortnite_version(&game_root)
 }
 
+pub fn validate_supported_fortnite_version(game_root: &str) -> Result<(), String> {
+    let version = detect_fortnite_version(game_root)?;
+    if version != "13.40" {
+        return Err(format!(
+            "This launcher is configured for Fortnite 13.40, but the selected build is {version}. Select the compatible 13.40 install to avoid the login failure loop."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod version_tests {
-    use super::{detect_fortnite_version, release_version_from_branch};
+    use super::{detect_fortnite_version, release_version_from_branch, validate_supported_fortnite_version};
     use std::path::PathBuf;
 
     fn make_game_root(version: &str) -> (PathBuf, PathBuf) {
@@ -147,6 +179,33 @@ mod version_tests {
 
         let (temp_root, game_root) = make_game_root("13.41");
         assert_eq!(detect_fortnite_version(&game_root.to_string_lossy()).unwrap(), "13.41");
+        std::fs::remove_dir_all(temp_root).unwrap();
+    }
+
+    #[test]
+    fn detects_version_from_build_version_string_when_branch_name_is_missing() {
+        let temp_root = std::env::temp_dir().join(format!("fishky-version-string-test-{}", uuid::Uuid::new_v4()));
+        let game_root = temp_root.join("Game");
+        let build_dir = game_root.join("FortniteGame").join("Build");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::write(
+            build_dir.join("Build.version"),
+            r#"{"BuildVersionString":"13.40","BuildId":"1234"}"#,
+        ).unwrap();
+
+        assert_eq!(detect_fortnite_version(&game_root.to_string_lossy()).unwrap(), "13.40");
+        std::fs::remove_dir_all(temp_root).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsupported_fortnite_versions() {
+        let (temp_root, game_root) = make_game_root("13.41");
+        let err = validate_supported_fortnite_version(&game_root.to_string_lossy()).unwrap_err();
+        assert!(err.contains("Fortnite 13.40"));
+        std::fs::remove_dir_all(temp_root).unwrap();
+
+        let (temp_root, game_root) = make_game_root("13.40");
+        assert!(validate_supported_fortnite_version(&game_root.to_string_lossy()).is_ok());
         std::fs::remove_dir_all(temp_root).unwrap();
     }
 }
@@ -332,24 +391,9 @@ fn copy_paks_from_folder(game_root: &str, source_folder: &std::path::Path) -> Re
     Ok(copied)
 }
 
-fn get_bundled_pak_folder(app: &AppHandle) -> std::path::PathBuf {
-    app.path_resolver()
-        .resource_dir()
-        .map(|resource_dir| resource_dir.join("resources").join("paks"))
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join("paks")
-        })
-}
-
-pub fn sync_paks_from_folder(game_root: &str, app: &AppHandle) -> Result<usize, String> {
-    let bundled_folder = get_bundled_pak_folder(app);
+pub fn sync_paks_from_folder(game_root: &str) -> Result<usize, String> {
     let player_folder = get_pak_drop_folder()?;
-    let bundled_count = copy_paks_from_folder(game_root, &bundled_folder)?;
-    let player_count = copy_paks_from_folder(game_root, &player_folder)?;
-    Ok(bundled_count + player_count)
+    copy_paks_from_folder(game_root, &player_folder)
 }
 
 #[tauri::command]
@@ -363,16 +407,18 @@ pub fn open_pak_drop_folder_cmd() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn sync_paks_cmd(game_root: String, app: AppHandle) -> Result<usize, String> {
-    sync_paks_from_folder(&game_root, &app)
+pub fn sync_paks_cmd(game_root: String) -> Result<usize, String> {
+    sync_paks_from_folder(&game_root)
 }
 
-const BUBBLE_PAK_URL: &str = "https://github.com/saavagedog/PAKS/raw/refs/heads/main/pakchunkBubble-WindowsClient_P.pak";
-const BUBBLE_SIG_URL: &str = "https://github.com/saavagedog/SIG/raw/refs/heads/main/pakchunkBubble-WindowsClient_P.sig";
+const BUBBLE_PAK_URL: &str = "https://github.com/vaillantmichaelyoute-max/FLHGasdsadadsad/raw/refs/heads/main/pakchunkBubble-WindowsClient_P.pak";
+const BUBBLE_SIG_URL: &str = "https://github.com/vaillantmichaelyoute-max/FLHGasdsadadsad/raw/refs/heads/main/pakchunkBubble-WindowsClient_P.sig";
+const MOBILE_PAK_URL: &str = "https://raw.githubusercontent.com/areyoulonleyye-droid/LOW-MESGHES/main/pakchunkLowMesh-WindowsClient_p.pak";
+const MOBILE_SIG_URL: &str = "https://raw.githubusercontent.com/areyoulonleyye-droid/LOW-MESGHES/main/pakchunkLowMesh-WindowsClient_p.sig";
 
-fn remove_bubble_build_files(game_root: &std::path::Path) -> Result<(), String> {
+fn remove_named_pak_files(game_root: &std::path::Path, filenames: &[&str]) -> Result<(), String> {
     let paks_path = game_root.join("FortniteGame").join("Content").join("Paks");
-    for filename in ["pakchunkBubble-WindowsClient_P.pak", "pakchunkBubble-WindowsClient_P.sig"] {
+    for filename in filenames {
         match std::fs::remove_file(paks_path.join(filename)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -380,6 +426,14 @@ fn remove_bubble_build_files(game_root: &std::path::Path) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+fn remove_bubble_build_files(game_root: &std::path::Path) -> Result<(), String> {
+    remove_named_pak_files(game_root, &["pakchunkBubble-WindowsClient_P.pak", "pakchunkBubble-WindowsClient_P.sig"])
+}
+
+fn remove_mobile_build_files(game_root: &std::path::Path) -> Result<(), String> {
+    remove_named_pak_files(game_root, &["pakchunkLowMesh-WindowsClient_p.pak", "pakchunkLowMesh-WindowsClient_p.sig"])
 }
 
 #[tauri::command]
@@ -417,6 +471,90 @@ pub async fn set_bubble_builds_cmd(game_roots: Vec<String>, enabled: bool, app: 
     Ok(())
 }
 
+#[tauri::command]
+pub async fn set_mobile_builds_cmd(game_roots: Vec<String>, enabled: bool, app: AppHandle) -> Result<(), String> {
+    if game_roots.is_empty() {
+        return Err("Add a Fortnite build before changing Mobile Builds.".to_string());
+    }
+
+    for game_root in game_roots {
+        let root = std::path::PathBuf::from(game_root);
+        if !enabled {
+            remove_mobile_build_files(&root)?;
+            continue;
+        }
+
+        let paks_path = root.join("FortniteGame").join("Content").join("Paks");
+        std::fs::create_dir_all(&paks_path).map_err(|error| error.to_string())?;
+        let window = app.get_window("main").ok_or("Main window not found")?;
+
+        for (url, filename) in [
+            (MOBILE_SIG_URL, "pakchunkLowMesh-WindowsClient_p.sig"),
+            (MOBILE_PAK_URL, "pakchunkLowMesh-WindowsClient_p.pak"),
+        ] {
+            let target_path = paks_path.join(filename);
+            if target_path.exists() {
+                continue;
+            }
+            let target = target_path.to_str().ok_or("Invalid Mobile Builds destination path")?;
+            download(url, filename, target, &window).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn update_ini_section(contents: &str, section: &str, entries: &[String]) -> String {
+    let header = format!("[{section}]");
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+    let start = lines.iter().position(|line| line.trim().eq_ignore_ascii_case(&header));
+    let replacement: Vec<String> = std::iter::once(header).chain(entries.iter().cloned()).collect();
+
+    if let Some(start) = start {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.trim().starts_with('[') && line.trim().ends_with(']'))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(lines.len());
+        lines.splice(start..end, replacement);
+    } else {
+        if !lines.is_empty() && !lines.last().is_some_and(String::is_empty) {
+            lines.push(String::new());
+        }
+        lines.extend(replacement);
+    }
+
+    let mut output = lines.join("\r\n");
+    output.push_str("\r\n");
+    output
+}
+
+#[tauri::command]
+pub fn save_preferred_item_slots_cmd(slots: Vec<String>) -> Result<(), String> {
+    const VALID_CATEGORIES: [&str; 8] = ["", "sniper", "assault-rifle", "shotgun", "smg", "pistol", "consumable", "utility"];
+    if slots.len() != 5 || slots.iter().any(|slot| !VALID_CATEGORIES.contains(&slot.as_str())) {
+        return Err("Preferred item slots must contain five valid categories.".to_string());
+    }
+
+    let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or("Could not locate the Fortnite user config folder")?;
+    let config_path = std::path::PathBuf::from(local_app_data)
+        .join("FortniteGame")
+        .join("Saved")
+        .join("Config")
+        .join("WindowsClient")
+        .join("GameUserSettings.ini");
+    let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let entries = slots.iter().enumerate().map(|(index, category)| {
+        format!("PreferredItemSlot{}={}", index + 1, if category.is_empty() { "none" } else { category })
+    }).collect::<Vec<_>>();
+    let updated = update_ini_section(&contents, "ProjectFishkLauncher", &entries);
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("Could not create Fortnite config folder: {error}"))?;
+    }
+    std::fs::write(&config_path, updated).map_err(|error| format!("Could not save preferred item slots to Fortnite config: {error}"))
+}
+
 #[cfg(test)]
 mod bubble_build_tests {
     use super::remove_bubble_build_files;
@@ -440,6 +578,62 @@ mod bubble_build_tests {
         assert!(!bubble_sig.exists());
         assert!(other_pak.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod mobile_build_tests {
+    use super::remove_mobile_build_files;
+
+    #[test]
+    fn removes_only_low_mesh_files_and_ignores_missing_files() {
+        let root = std::env::temp_dir().join(format!("fishky-mobile-test-{}", uuid::Uuid::new_v4()));
+        let paks = root.join("FortniteGame").join("Content").join("Paks");
+        std::fs::create_dir_all(&paks).unwrap();
+        let mobile_pak = paks.join("pakchunkLowMesh-WindowsClient_p.pak");
+        let mobile_sig = paks.join("pakchunkLowMesh-WindowsClient_p.sig");
+        let other_pak = paks.join("pakchunkOther-WindowsClient.pak");
+        std::fs::write(&mobile_pak, b"pak").unwrap();
+        std::fs::write(&mobile_sig, b"sig").unwrap();
+        std::fs::write(&other_pak, b"other").unwrap();
+
+        remove_mobile_build_files(&root).unwrap();
+        remove_mobile_build_files(&root).unwrap();
+
+        assert!(!mobile_pak.exists());
+        assert!(!mobile_sig.exists());
+        assert!(other_pak.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod preferred_item_slot_ini_tests {
+    use super::update_ini_section;
+
+    #[test]
+    fn updates_only_the_launcher_section_and_is_idempotent() {
+        let original = "[/Script/FortniteGame.FortGameUserSettings]\r\nSomeSetting=1\r\n\r\n[ProjectFishkLauncher]\r\nPreferredItemSlot1=sniper\r\n[Other]\r\nKeep=true\r\n";
+        let entries = vec![
+            "PreferredItemSlot1=pistol".to_string(),
+            "PreferredItemSlot2=none".to_string(),
+        ];
+
+        let updated = update_ini_section(original, "ProjectFishkLauncher", &entries);
+        let updated_again = update_ini_section(&updated, "ProjectFishkLauncher", &entries);
+
+        assert!(updated.contains("SomeSetting=1"));
+        assert!(updated.contains("[Other]\r\nKeep=true"));
+        assert!(updated.contains("PreferredItemSlot1=pistol\r\nPreferredItemSlot2=none"));
+        assert!(!updated.contains("PreferredItemSlot1=sniper"));
+        assert_eq!(updated, updated_again);
+    }
+
+    #[test]
+    fn creates_launcher_section_without_replacing_existing_config() {
+        let updated = update_ini_section("[Existing]\r\nValue=true\r\n", "ProjectFishkLauncher", &["PreferredItemSlot1=sniper".to_string()]);
+        assert!(updated.starts_with("[Existing]\r\nValue=true"));
+        assert!(updated.contains("[ProjectFishkLauncher]\r\nPreferredItemSlot1=sniper"));
     }
 }
 
@@ -557,52 +751,79 @@ pub async fn launch_real_launcher(root: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-#[tauri::command]
-pub async fn dll_replace(path: &str, url: String, _app: tauri::AppHandle) -> Result<bool, String> {
-    use tauri::Manager;
-
-    let trimmed_url = url.trim();
-    if trimmed_url.is_empty() {
-        println!("DLL replacement skipped: no valid redirect URL configured.");
-        return Ok(true);
-    }
-    
-    let path_buf = std::path::PathBuf::from(path);
-    let mut nvidia_path = path_buf.clone();
-    nvidia_path.push("Engine\\Binaries\\ThirdParty\\NVIDIA\\NVaftermath\\Win64\\GFSDK_Aftermath_Lib.x64.dll");
-
-    if nvidia_path.exists() {
-        let _ = std::fs::remove_file(&nvidia_path);
-    }
-
-    let window = _app.get_window("main").ok_or("Main window not found")?;
-    let target_str = nvidia_path.to_str().unwrap();
-
-    if let Err(err) = download(trimmed_url, "GFSDK_Aftermath_Lib.x64.dll", target_str, &window).await {
-        eprintln!("DLL replacement failed: {}", err);
-        return Ok(false);
-    }
-
-    Ok(true)
-}
-
 pub fn inject_dll(pid: u32, dll_path: &str) -> Result<(), String> {
     unsafe {
         let handle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-        if handle.is_null() { return Err("Failed to open process".into()); }
+        if handle.is_null() {
+            return Err(format!("Could not open process {pid}: {}", std::io::Error::last_os_error()));
+        }
 
         let path_null = format!("{}\0", dll_path);
         let bytes = path_null.as_bytes();
-        
         let mem = VirtualAllocEx(handle, std::ptr::null_mut(), bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        WriteProcessMemory(handle, mem, bytes.as_ptr() as *const _, bytes.len(), std::ptr::null_mut());
+        if mem.is_null() {
+            let error = std::io::Error::last_os_error();
+            CloseHandle(handle);
+            return Err(format!("Could not allocate memory in process {pid}: {error}"));
+        }
 
         let k32 = GetModuleHandleA("kernel32.dll\0".as_ptr() as *const i8);
+        if k32.is_null() {
+            let error = std::io::Error::last_os_error();
+            VirtualFreeEx(handle, mem, 0, MEM_RELEASE);
+            CloseHandle(handle);
+            return Err(format!("Could not find kernel32.dll: {error}"));
+        }
         let load_lib = GetProcAddress(k32, "LoadLibraryA\0".as_ptr() as *const i8);
+        if load_lib.is_null() {
+            let error = std::io::Error::last_os_error();
+            VirtualFreeEx(handle, mem, 0, MEM_RELEASE);
+            CloseHandle(handle);
+            return Err(format!("Could not find LoadLibraryA: {error}"));
+        }
 
-        CreateRemoteThread(handle, std::ptr::null_mut(), 0, Some(std::mem::transmute(load_lib)), mem, 0, std::ptr::null_mut());
-        
+        let mut bytes_written = 0;
+        if WriteProcessMemory(handle, mem, bytes.as_ptr() as *const _, bytes.len(), &mut bytes_written) == 0 || bytes_written != bytes.len() {
+            let error = std::io::Error::last_os_error();
+            VirtualFreeEx(handle, mem, 0, MEM_RELEASE);
+            CloseHandle(handle);
+            return Err(format!("Could not write the DLL path into process {pid}: {error}"));
+        }
+
+        let thread = CreateRemoteThread(handle, std::ptr::null_mut(), 0, Some(std::mem::transmute(load_lib)), mem, 0, std::ptr::null_mut());
+        if thread.is_null() {
+            let error = std::io::Error::last_os_error();
+            VirtualFreeEx(handle, mem, 0, MEM_RELEASE);
+            CloseHandle(handle);
+            return Err(format!("Could not start the DLL load thread in process {pid}: {error}"));
+        }
+
+        let wait_result = WaitForSingleObject(thread, 30_000);
+        if wait_result != 0 {
+            if wait_result == 0x00000102 {
+                let error = format!("DLL load did not finish within 30 seconds in process {pid}");
+                CloseHandle(thread);
+                CloseHandle(handle);
+                return Err(error);
+            }
+            let error = std::io::Error::last_os_error();
+            CloseHandle(thread);
+            VirtualFreeEx(handle, mem, 0, MEM_RELEASE);
+            CloseHandle(handle);
+            return Err(format!("Could not wait for the DLL load in process {pid}: {error}"));
+        }
+
+        let mut load_result = 0;
+        let read_result = GetExitCodeThread(thread, &mut load_result);
+        CloseHandle(thread);
+        VirtualFreeEx(handle, mem, 0, MEM_RELEASE);
         CloseHandle(handle);
+        if read_result == 0 {
+            return Err(format!("Could not read the DLL load result for process {pid}: {}", std::io::Error::last_os_error()));
+        }
+        if load_result == 0 {
+            return Err(format!("LoadLibraryA failed to load {dll_path} into process {pid}"));
+        }
         Ok(())
     }
 
@@ -610,31 +831,44 @@ pub fn inject_dll(pid: u32, dll_path: &str) -> Result<(), String> {
 
 pub async fn launch_fn(
     path: &str,
-    redirect_url: String, 
-    inject_urls: String,
-    app: AppHandle,
+    backend_url: String,
     email: String,
     password: String,
     eor: bool,
     ror: bool,
-    client_dll_path: String,
+    disable_pre_edits: bool,
     stretch_resolution_enabled: bool,
     resolution_width: u32,
     resolution_height: u32,
 ) -> Result<bool, String> {
-    let client_dll_path = client_dll_path.trim();
-    if ror && client_dll_path.is_empty() {
-        return Err("Select the ErbiumClient.dll to use Reset on Release.".to_string());
-    }
-    if !client_dll_path.is_empty() && !std::path::Path::new(client_dll_path).is_file() {
-        return Err("The selected ErbiumClient.dll could not be found.".to_string());
+    validate_supported_fortnite_version(path)?;
+
+    let backend_url = backend_url.trim().trim_end_matches('/');
+    if !(backend_url.starts_with("http://") || backend_url.starts_with("https://")) {
+        return Err("VITE_BACKEND_URL must start with http:// or https://.".to_string());
     }
 
-    sync_paks_from_folder(path, &app)?;
-
-    if let Err(e) = dll_replace(path, redirect_url, app.clone()).await {
-        return Err(format!("Could not replace DLL: {}", e));
+    let backend_health_url = format!("{backend_url}/fortnite/api/cloudstorage/system");
+    let backend_response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("Could not create backend connection: {error}"))?
+        .get(&backend_health_url)
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not reach the Project Fishk backend at {backend_url}. Start the backend and make sure Radmin VPN is connected. ({error})"
+            )
+        })?;
+    if !backend_response.status().is_success() {
+        return Err(format!(
+            "The game backend at {backend_url} returned HTTP {}. Check the configured backend URL and confirm that LawinServer is running.",
+            backend_response.status()
+        ));
     }
+
+    sync_paks_from_folder(path)?;
 
     let base = std::path::PathBuf::from(path);
 
@@ -671,6 +905,7 @@ pub async fn launch_fn(
         "-fltoken=3db3ba5dcbd2e16703f3978d".to_string(),
         "-caldera=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50X2lkIjoiYmU5ZGE1YzJmYmVhNDQwN2IyZjQwZWJhYWQ4NTlhZDQiLCJnZW5lcmF0ZWQiOjE2Mzg3MTcyNzgsImNhbGRlcmFHdWlkIjoiMzgxMGI4NjMtMmE2NS00NDU3LTliNTgtNGRhYjNiNDgyYTg2IiwiYWNQcm92aWRlciI6IkVhc3lBbnRpQ2hlYXQiLCJub3RlcyI6IiIsImZhbGxiYWNrIjpmYWxzZX0.VAWQB67RTxhiWOxx7DBjnzDnXyyEnX7OljJm-j2d88G_WgwQ9wrE6lwMEHZHjBd1ISJdUO1UVUqkfLdU5nofBQ".to_string(),
         "-AUTH_TYPE=epic".to_string(),
+        format!("-backend={backend_url}"),
     ];
 
     if eor {
@@ -678,6 +913,9 @@ pub async fn launch_fn(
     }
     if ror {
         fort_args.push("-ror".to_string());
+    }
+    if disable_pre_edits {
+        fort_args.push("-disablepreedits".to_string());
     }
     if stretch_resolution_enabled {
         if !(640..=7680).contains(&resolution_width) || !(480..=4320).contains(&resolution_height) {
@@ -698,33 +936,6 @@ pub async fn launch_fn(
 
     let pid = fort_cmd.id();
     PLAYER_GAME_PID.store(pid, Ordering::SeqCst);
-
-    tokio::time::sleep(Duration::from_secs(60)).await;
-
-    if !client_dll_path.is_empty() {
-        inject_dll(pid, client_dll_path)
-            .map_err(|error| format!("Could not inject ErbiumClient.dll: {error}"))?;
-    }
-
-    if !inject_urls.is_empty() {
-        let window = app.get_window("main").ok_or("No window")?;
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        for url in inject_urls.split(',') {
-            let url = url.trim();
-            if url.is_empty() { continue; }
-            
-            let filename = url.split('/').last().unwrap_or("inject.dll");
-            let temp_path = std::env::temp_dir().join(filename);
-            let temp_path_str = temp_path.to_str().ok_or("Invalid temp path")?;
-
-            download(url, filename, temp_path_str, &window).await?;
-            
-            let _ = inject_dll(pid, temp_path_str);
-        }
-    }
-
-    println!("Fortnite launched and DLLs injected successfully.");
     Ok(true)
 
     
